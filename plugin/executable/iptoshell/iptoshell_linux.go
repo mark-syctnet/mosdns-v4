@@ -86,7 +86,6 @@ func (p *iptoshellPlugin) addIPtoshell(r *dns.Msg) error {
 			}    
 			return nil
 			
-
 		case *dns.AAAA:
 			if len(p.args.SetName6) == 0 {
 				continue
