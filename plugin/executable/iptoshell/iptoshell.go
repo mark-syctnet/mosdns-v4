@@ -36,6 +36,7 @@ type Args struct {
 	Mask6    int    `yaml:"mask6"` // default 32
 }
 
+
 func Init(bp *coremain.BP, args interface{}) (p coremain.Plugin, err error) {
 	return newiptoshellPlugin(bp, args.(*Args))
 }
