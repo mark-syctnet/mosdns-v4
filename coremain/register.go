@@ -21,9 +21,10 @@ package coremain
 
 import (
 	"fmt"
-	"github.com/IrineSistiana/mosdns/v4/pkg/metrics"
 	"github.com/IrineSistiana/mosdns/v4/pkg/utils"
+	"github.com/prometheus/client_golang/prometheus"
 	"go.uber.org/zap"
+	"reflect"
 	"sync"
 )
 
@@ -96,10 +97,20 @@ func NewPlugin(c *PluginConfig, lg *zap.Logger, m *Mosdns) (p Plugin, err error)
 	// parse args
 	if typeInfo.NewArgs != nil {
 		args := typeInfo.NewArgs()
-		err = utils.WeakDecode(c.Args, args)
-		if err != nil {
-			return nil, fmt.Errorf("unable to decode plugin args: %w", err)
+		if m, ok := c.Args.(map[string]interface{}); ok {
+			if err = utils.WeakDecode(m, args); err != nil {
+				return nil, fmt.Errorf("unable to decode plugin args: %w", err)
+			}
+		} else if c.Args != nil {
+			tc := reflect.TypeOf(c.Args) // args type from config
+			tp := reflect.TypeOf(args)   // args type from plugin init func
+			if tc == tp {
+				args = c.Args
+			} else {
+				return nil, fmt.Errorf("invalid plugin args type, want %s, got %s", tp.String(), tc.String())
+			}
 		}
+
 		return typeInfo.NewPlugin(bp, args)
 	}
 
@@ -150,15 +161,12 @@ func LoadNewPersetPluginFuncs() map[string]NewPersetPluginFunc {
 // BP represents a basic plugin, which implements Plugin.
 // It also has an internal logger, for convenience.
 type BP struct {
-	Metrics metrics.Registry
-
 	tag, typ string
 
 	l *zap.Logger
 	s *zap.SugaredLogger
 
-	m          *Mosdns
-	metricsReg *metrics.Registry
+	m *Mosdns
 }
 
 // NewBP creates a new BP and initials its logger.
@@ -166,6 +174,7 @@ func NewBP(tag string, typ string, lg *zap.Logger, m *Mosdns) *BP {
 	if lg == nil {
 		lg = zap.NewNop()
 	}
+	lg = lg.Named(tag)
 	return &BP{tag: tag, typ: typ, l: lg, s: lg.Sugar(), m: m}
 }
 
@@ -189,10 +198,9 @@ func (p *BP) M() *Mosdns {
 	return p.m
 }
 
-func (p *BP) GetMetricsReg() *metrics.Registry {
-	return p.m.pluginsMetricsReg.GetOrSet(p.tag, func() metrics.Var {
-		return metrics.NewRegistry()
-	}).(*metrics.Registry)
+// GetMetricsReg return a prometheus.Registerer with a prefix of "plugin_${plugin_tag}_]"
+func (p *BP) GetMetricsReg() prometheus.Registerer {
+	return prometheus.WrapRegistererWithPrefix(fmt.Sprintf("plugin_%s_", p.tag), p.m.GetMetricsReg())
 }
 
 func (p *BP) Close() error {

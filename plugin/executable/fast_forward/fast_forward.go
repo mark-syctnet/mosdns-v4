@@ -28,12 +28,11 @@ import (
 	"github.com/IrineSistiana/mosdns/v4/coremain"
 	"github.com/IrineSistiana/mosdns/v4/pkg/bundled_upstream"
 	"github.com/IrineSistiana/mosdns/v4/pkg/executable_seq"
-	"github.com/IrineSistiana/mosdns/v4/pkg/metrics"
 	"github.com/IrineSistiana/mosdns/v4/pkg/query_context"
 	"github.com/IrineSistiana/mosdns/v4/pkg/upstream"
 	"github.com/IrineSistiana/mosdns/v4/pkg/utils"
 	"github.com/miekg/dns"
-	"strconv"
+	"io"
 	"strings"
 	"time"
 )
@@ -50,8 +49,8 @@ type fastForward struct {
 	*coremain.BP
 	args *Args
 
-	upstreamBundle  *bundled_upstream.BundledUpstream
-	trackedUpstream []upstream.Upstream
+	upstreamWrappers []bundled_upstream.Upstream
+	upstreamsCloser  []io.Closer
 }
 
 type Args struct {
@@ -60,17 +59,19 @@ type Args struct {
 }
 
 type UpstreamConfig struct {
-	Addr     string `yaml:"addr"` // required
-	DialAddr string `yaml:"dial_addr"`
-	Trusted  bool   `yaml:"trusted"`
-	Socks5   string `yaml:"socks5"`
-	SoMark   int    `yaml:"so_mark"`
+	Addr         string `yaml:"addr"` // required
+	DialAddr     string `yaml:"dial_addr"`
+	Trusted      bool   `yaml:"trusted"`
+	Socks5       string `yaml:"socks5"`
+	SoMark       int    `yaml:"so_mark"`
+	BindToDevice string `yaml:"bind_to_device"`
 
-	IdleTimeout        int  `yaml:"idle_timeout"`
-	MaxConns           int  `yaml:"max_conns"`
-	EnablePipeline     bool `yaml:"enable_pipeline"`
-	EnableHTTP3        bool `yaml:"enable_http3"`
-	InsecureSkipVerify bool `yaml:"insecure_skip_verify"`
+	IdleTimeout        int    `yaml:"idle_timeout"`
+	MaxConns           int    `yaml:"max_conns"`
+	EnablePipeline     bool   `yaml:"enable_pipeline"`
+	EnableHTTP3        bool   `yaml:"enable_http3"`
+	Bootstrap          string `yaml:"bootstrap"`
+	InsecureSkipVerify bool   `yaml:"insecure_skip_verify"`
 }
 
 func Init(bp *coremain.BP, args interface{}) (p coremain.Plugin, err error) {
@@ -86,8 +87,6 @@ func newFastForward(bp *coremain.BP, args *Args) (*fastForward, error) {
 		BP:   bp,
 		args: args,
 	}
-
-	us := make([]bundled_upstream.Upstream, 0)
 
 	// rootCAs
 	var rootCAs *x509.CertPool
@@ -106,7 +105,7 @@ func newFastForward(bp *coremain.BP, args *Args) (*fastForward, error) {
 
 		if strings.HasPrefix(c.Addr, "udpme://") {
 			u := newUDPME(c.Addr[8:], c.Trusted)
-			us = append(us, u)
+			f.upstreamWrappers = append(f.upstreamWrappers, u)
 			if i == 0 {
 				u.trusted = true
 			}
@@ -117,10 +116,12 @@ func newFastForward(bp *coremain.BP, args *Args) (*fastForward, error) {
 			DialAddr:       c.DialAddr,
 			Socks5:         c.Socks5,
 			SoMark:         c.SoMark,
+			BindToDevice:   c.BindToDevice,
 			IdleTimeout:    time.Duration(c.IdleTimeout) * time.Second,
 			MaxConns:       c.MaxConns,
 			EnablePipeline: c.EnablePipeline,
 			EnableHTTP3:    c.EnableHTTP3,
+			Bootstrap:      c.Bootstrap,
 			TLSConfig: &tls.Config{
 				InsecureSkipVerify: c.InsecureSkipVerify,
 				RootCAs:            rootCAs,
@@ -135,31 +136,20 @@ func newFastForward(bp *coremain.BP, args *Args) (*fastForward, error) {
 			return nil, fmt.Errorf("failed to init upstream: %w", err)
 		}
 
-		wu := &upstreamWrapper{
+		w := &upstreamWrapper{
 			address: c.Addr,
 			trusted: c.Trusted,
 			u:       u,
-			m: upstreamMetrics{
-				query:   metrics.NewCounter(),
-				err:     metrics.NewCounter(),
-				latency: metrics.NewHistogram(128),
-			},
 		}
-		upstreamReg := metrics.NewRegistry()
-		upstreamReg.Set("query", wu.m.query)
-		upstreamReg.Set("err", wu.m.err)
-		upstreamReg.Set("latency", wu.m.latency)
-		bp.GetMetricsReg().Set(strconv.Itoa(i), upstreamReg)
 
 		if i == 0 { // Set first upstream as trusted upstream.
-			wu.trusted = true
+			w.trusted = true
 		}
 
-		us = append(us, wu)
-		f.trackedUpstream = append(f.trackedUpstream, u)
+		f.upstreamWrappers = append(f.upstreamWrappers, w)
+		f.upstreamsCloser = append(f.upstreamsCloser, u)
 	}
 
-	f.upstreamBundle = bundled_upstream.NewBundledUpstream(us, bp.L())
 	return f, nil
 }
 
@@ -167,26 +157,10 @@ type upstreamWrapper struct {
 	address string
 	trusted bool
 	u       upstream.Upstream
-
-	m upstreamMetrics
-}
-
-type upstreamMetrics struct {
-	query   *metrics.Counter
-	err     *metrics.Counter
-	latency *metrics.Histogram
 }
 
 func (u *upstreamWrapper) Exchange(ctx context.Context, q *dns.Msg) (*dns.Msg, error) {
-	u.m.query.Inc(1)
-	start := time.Now()
-	r, err := u.u.ExchangeContext(ctx, q)
-	if err != nil {
-		u.m.err.Inc(1)
-	} else {
-		u.m.latency.Update(time.Since(start).Milliseconds())
-	}
-	return r, err
+	return u.u.ExchangeContext(ctx, q)
 }
 
 func (u *upstreamWrapper) Address() string {
@@ -206,23 +180,20 @@ func (f *fastForward) Exec(ctx context.Context, qCtx *query_context.Context, nex
 	if err != nil {
 		return err
 	}
-
 	return executable_seq.ExecChainNode(ctx, qCtx, next)
 }
 
 func (f *fastForward) exec(ctx context.Context, qCtx *query_context.Context) (err error) {
-	r, err := f.upstreamBundle.ExchangeParallel(ctx, qCtx)
+	r, err := bundled_upstream.ExchangeParallel(ctx, qCtx, f.upstreamWrappers, f.L())
 	if err != nil {
-		qCtx.SetResponse(nil, query_context.ContextStatusServerFailed)
 		return err
 	}
-
-	qCtx.SetResponse(r, query_context.ContextStatusResponded)
+	qCtx.SetResponse(r)
 	return nil
 }
 
 func (f *fastForward) Shutdown() error {
-	for _, u := range f.trackedUpstream {
+	for _, u := range f.upstreamsCloser {
 		u.Close()
 	}
 	return nil

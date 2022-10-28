@@ -21,15 +21,14 @@ package ecs
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"github.com/IrineSistiana/mosdns/v4/coremain"
 	"github.com/IrineSistiana/mosdns/v4/pkg/dnsutils"
 	"github.com/IrineSistiana/mosdns/v4/pkg/executable_seq"
 	"github.com/IrineSistiana/mosdns/v4/pkg/query_context"
+	"github.com/IrineSistiana/mosdns/v4/pkg/utils"
 	"github.com/miekg/dns"
-	"go.uber.org/zap"
-	"net"
+	"net/netip"
 )
 
 const PluginType = "ecs"
@@ -53,18 +52,30 @@ type Args struct {
 	ForceOverwrite bool `yaml:"force_overwrite"`
 
 	// mask for ecs
-	Mask4 uint8 `yaml:"mask4"` // default 24
-	Mask6 uint8 `yaml:"mask6"` // default 48
+	Mask4 int `yaml:"mask4"` // default 24
+	Mask6 int `yaml:"mask6"` // default 48
 
 	// pre-set address
 	IPv4 string `yaml:"ipv4"`
 	IPv6 string `yaml:"ipv6"`
 }
 
+func (a *Args) Init() error {
+	if ok := utils.CheckNumRange(a.Mask4, 0, 32); !ok {
+		return fmt.Errorf("invalid mask4 %d, should between 0~32", a.Mask4)
+	}
+	if ok := utils.CheckNumRange(a.Mask6, 0, 128); !ok {
+		return fmt.Errorf("invalid mask6 %d, should between 0~128", a.Mask6)
+	}
+	utils.SetDefaultNum(&a.Mask4, 24)
+	utils.SetDefaultNum(&a.Mask6, 48)
+	return nil
+}
+
 type ecsPlugin struct {
 	*coremain.BP
 	args       *Args
-	ipv4, ipv6 net.IP
+	ipv4, ipv6 netip.Addr
 }
 
 func Init(bp *coremain.BP, args interface{}) (p coremain.Plugin, err error) {
@@ -72,37 +83,35 @@ func Init(bp *coremain.BP, args interface{}) (p coremain.Plugin, err error) {
 }
 
 func newPlugin(bp *coremain.BP, args *Args) (p *ecsPlugin, err error) {
-	if args.Mask4 <= 0 || args.Mask4 > 32 {
-		args.Mask4 = 24
+	if err := args.Init(); err != nil {
+		return nil, err
 	}
-	if args.Mask6 <= 0 || args.Mask6 > 128 {
-		args.Mask6 = 48
-	}
+
 	ep := new(ecsPlugin)
 	ep.BP = bp
 	ep.args = args
 
 	if len(args.IPv4) != 0 {
-		ip := net.ParseIP(args.IPv4)
-		if ip == nil {
-			return nil, fmt.Errorf("invaild ipv4 address %s", args.IPv4)
+		addr, err := netip.ParseAddr(args.IPv4)
+		if err != nil {
+			return nil, fmt.Errorf("invaild ipv4 address, %w", err)
 		}
-		if ip4 := ip.To4(); ip4 == nil {
+		if !addr.Is4() {
 			return nil, fmt.Errorf("%s is not a ipv4 address", args.IPv4)
 		} else {
-			ep.ipv4 = ip4
+			ep.ipv4 = addr
 		}
 	}
 
 	if len(args.IPv6) != 0 {
-		ip := net.ParseIP(args.IPv6)
-		if ip == nil {
-			return nil, fmt.Errorf("invaild ipv6 address %s", args.IPv6)
+		addr, err := netip.ParseAddr(args.IPv6)
+		if err != nil {
+			return nil, fmt.Errorf("invaild ipv6 address, %w", err)
 		}
-		if ip6 := ip.To16(); ip6 == nil {
+		if !addr.Is6() {
 			return nil, fmt.Errorf("%s is not a ipv6 address", args.IPv6)
 		} else {
-			ep.ipv6 = ip6
+			ep.ipv6 = addr
 		}
 	}
 
@@ -110,15 +119,9 @@ func newPlugin(bp *coremain.BP, args *Args) (p *ecsPlugin, err error) {
 }
 
 // Exec tries to append ECS to qCtx.Q().
-// If an error occurred, Exec will just log it to internal logger.
-// It will never raise its own error.
 func (e *ecsPlugin) Exec(ctx context.Context, qCtx *query_context.Context, next executable_seq.ExecutableChainNode) error {
-	upgraded, newECS, err := e.addECS(qCtx)
-	if err != nil {
-		e.L().Warn("internal err", zap.Error(err))
-	}
-
-	err = executable_seq.ExecChainNode(ctx, qCtx, next)
+	upgraded, newECS := e.addECS(qCtx)
+	err := executable_seq.ExecChainNode(ctx, qCtx, next)
 	if err != nil {
 		return err
 	}
@@ -135,55 +138,48 @@ func (e *ecsPlugin) Exec(ctx context.Context, qCtx *query_context.Context, next 
 	return nil
 }
 
-var (
-	errNoClientAddr = errors.New("context doesn't have a client ip")
-)
-
-// addECS adds *dns.EDNS0_SUBNET record to q.
-// The clientAddr can be nil.
-// First returned bool: Whether the addECS upgraded the q to a EDNS0 enabled query.
-// Second returned bool: Whether the addECS added a *dns.EDNS0_SUBNET to q that didn't
+// addECS adds a *dns.EDNS0_SUBNET record to q.
+// upgraded: Whether the addECS upgraded the q to a EDNS0 enabled query.
+// newECS: Whether the addECS added a *dns.EDNS0_SUBNET to q that didn't
 // have a *dns.EDNS0_SUBNET before.
-func (e *ecsPlugin) addECS(qCtx *query_context.Context) (upgraded bool, newECS bool, err error) {
+func (e *ecsPlugin) addECS(qCtx *query_context.Context) (upgraded bool, newECS bool) {
 	q := qCtx.Q()
-
-	clientIP := qCtx.ReqMeta().ClientIP // Maybe nil.
-
 	opt := q.IsEdns0()
 	hasECS := opt != nil && dnsutils.GetECS(opt) != nil
 	if hasECS && !e.args.ForceOverwrite {
 		// Argument args.ForceOverwrite is disabled. q already has an edns0 subnet. Skip it.
-		return false, false, nil
+		return false, false
 	}
 
 	var ecs *dns.EDNS0_SUBNET
 	if e.args.Auto { // use client ip
-		if clientIP == nil {
-			return false, false, errNoClientAddr
+		clientAddr := qCtx.ReqMeta().ClientAddr
+		if !clientAddr.IsValid() {
+			return false, false
 		}
-		if ip4 := clientIP.To4(); ip4 != nil { // is ipv4
-			ecs = dnsutils.NewEDNS0Subnet(ip4, e.args.Mask4, false)
-		} else {
-			if ip6 := clientIP.To16(); ip6 != nil { // is ipv6
-				ecs = dnsutils.NewEDNS0Subnet(ip6, e.args.Mask6, true)
-			} else { // non
-				return false, false, fmt.Errorf("invalid client ip address [%s]", clientIP)
-			}
+
+		switch {
+		case clientAddr.Is4():
+			ecs = dnsutils.NewEDNS0Subnet(clientAddr.AsSlice(), uint8(e.args.Mask4), false)
+		case clientAddr.Is4In6():
+			ecs = dnsutils.NewEDNS0Subnet(clientAddr.Unmap().AsSlice(), uint8(e.args.Mask4), false)
+		case clientAddr.Is6():
+			ecs = dnsutils.NewEDNS0Subnet(clientAddr.AsSlice(), uint8(e.args.Mask6), true)
 		}
 	} else { // use preset ip
 		switch {
 		case checkQueryType(q, dns.TypeA):
-			if e.ipv4 != nil {
-				ecs = dnsutils.NewEDNS0Subnet(e.ipv4, e.args.Mask4, false)
-			} else if e.ipv6 != nil {
-				ecs = dnsutils.NewEDNS0Subnet(e.ipv6, e.args.Mask6, true)
+			if e.ipv4.IsValid() {
+				ecs = dnsutils.NewEDNS0Subnet(e.ipv4.AsSlice(), uint8(e.args.Mask4), false)
+			} else if e.ipv6.IsValid() {
+				ecs = dnsutils.NewEDNS0Subnet(e.ipv6.AsSlice(), uint8(e.args.Mask6), true)
 			}
 
 		case checkQueryType(q, dns.TypeAAAA):
-			if e.ipv6 != nil {
-				ecs = dnsutils.NewEDNS0Subnet(e.ipv6, e.args.Mask6, true)
-			} else if e.ipv4 != nil {
-				ecs = dnsutils.NewEDNS0Subnet(e.ipv4, e.args.Mask4, false)
+			if e.ipv6.IsValid() {
+				ecs = dnsutils.NewEDNS0Subnet(e.ipv6.AsSlice(), uint8(e.args.Mask6), true)
+			} else if e.ipv4.IsValid() {
+				ecs = dnsutils.NewEDNS0Subnet(e.ipv4.AsSlice(), uint8(e.args.Mask4), false)
 			}
 		}
 	}
@@ -194,9 +190,9 @@ func (e *ecsPlugin) addECS(qCtx *query_context.Context) (upgraded bool, newECS b
 			opt = dnsutils.UpgradeEDNS0(q)
 		}
 		newECS = dnsutils.AddECS(opt, ecs, true)
-		return upgraded, newECS, nil
+		return upgraded, newECS
 	}
-	return false, false, nil
+	return false, false
 }
 
 func checkQueryType(m *dns.Msg, typ uint16) bool {

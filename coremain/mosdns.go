@@ -23,10 +23,14 @@ import (
 	"errors"
 	"fmt"
 	"github.com/IrineSistiana/mosdns/v4/mlog"
+	"github.com/IrineSistiana/mosdns/v4/pkg/concurrent_limiter"
 	"github.com/IrineSistiana/mosdns/v4/pkg/data_provider"
 	"github.com/IrineSistiana/mosdns/v4/pkg/executable_seq"
-	"github.com/IrineSistiana/mosdns/v4/pkg/metrics"
+	"github.com/IrineSistiana/mosdns/v4/pkg/ip_observer"
 	"github.com/IrineSistiana/mosdns/v4/pkg/safe_close"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/collectors"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"go.uber.org/zap"
 	"net/http"
 	"net/http/pprof"
@@ -48,9 +52,9 @@ type Mosdns struct {
 	httpAPIMux    *http.ServeMux
 	httpAPIServer *http.Server
 
-	rootMetricsReg    *metrics.Registry
-	pluginsMetricsReg *metrics.Registry
-	serversMetricsReg *metrics.Registry
+	metricsReg *prometheus.Registry
+
+	badIPObserver ip_observer.IPObserver
 
 	sc *safe_close.SafeClose
 }
@@ -67,20 +71,41 @@ func RunMosdns(cfg *Config) error {
 		execs:       make(map[string]executable_seq.Executable),
 		matchers:    make(map[string]executable_seq.Matcher),
 		httpAPIMux:  http.NewServeMux(),
+		metricsReg:  newMetricsReg(),
 		sc:          safe_close.NewSafeClose(),
 	}
-	m.rootMetricsReg = metrics.NewRegistry()
-	m.pluginsMetricsReg = metrics.NewRegistry()
-	m.serversMetricsReg = metrics.NewRegistry()
-	m.rootMetricsReg.Set("plugins", m.pluginsMetricsReg)
-	m.rootMetricsReg.Set("servers", m.serversMetricsReg)
 
-	m.httpAPIMux.HandleFunc("/metrics/", metrics.HandleFunc(m.rootMetricsReg, m.logger))
+	m.httpAPIMux.Handle("/metrics", promhttp.HandlerFor(m.metricsReg, promhttp.HandlerOpts{}))
 	m.httpAPIMux.HandleFunc("/debug/pprof/", pprof.Index)
 	m.httpAPIMux.HandleFunc("/debug/pprof/cmdline", pprof.Cmdline)
 	m.httpAPIMux.HandleFunc("/debug/pprof/profile", pprof.Profile)
 	m.httpAPIMux.HandleFunc("/debug/pprof/symbol", pprof.Symbol)
 	m.httpAPIMux.HandleFunc("/debug/pprof/trace", pprof.Trace)
+
+	// Init ip observer
+	obCfg := cfg.Security.BadIPObserver
+	obCfg.Init()
+	if obCfg.Threshold > 0 {
+		ob, err := ip_observer.NewBadIPObserver(ip_observer.BadIPObserverOpts{
+			HPLimiterOpts: concurrent_limiter.HPLimiterOpts{
+				Threshold: obCfg.Threshold,
+				Interval:  time.Duration(obCfg.Interval) * time.Second,
+				IPv4Mask:  obCfg.IPv4Mask,
+				IPv6Mask:  obCfg.IPv6Mask,
+			},
+			TTL:              time.Duration(obCfg.TTL) * time.Second,
+			OnUpdateCallBack: obCfg.OnUpdateCallBack,
+			Logger:           lg,
+		})
+		if err != nil {
+			return fmt.Errorf("failed to init bad ip observer, %w", err)
+		}
+		m.badIPObserver = ob
+		defer ob.Close()
+		m.httpAPIMux.Handle("/security/bad_ip_observer", ob)
+	} else {
+		m.badIPObserver = ip_observer.NewNopObserver()
+	}
 
 	// Init data manager
 	dupTag := make(map[string]struct{})
@@ -196,16 +221,13 @@ func (m *Mosdns) GetExecutables() map[string]executable_seq.Executable {
 	return m.execs
 }
 
-func (m *Mosdns) GetPluginMetricsReg() *metrics.Registry {
-	return m.pluginsMetricsReg
-}
-
-func (m *Mosdns) GetServerMetricsReg() *metrics.Registry {
-	return m.serversMetricsReg
-}
-
 func (m *Mosdns) GetMatchers() map[string]executable_seq.Matcher {
 	return m.matchers
+}
+
+// GetMetricsReg returns a prometheus.Registerer with a prefix of "mosdns_"
+func (m *Mosdns) GetMetricsReg() prometheus.Registerer {
+	return prometheus.WrapRegistererWithPrefix("mosdns_", m.metricsReg)
 }
 
 // GetHTTPAPIMux returns the api http.ServeMux.
@@ -215,4 +237,16 @@ func (m *Mosdns) GetMatchers() map[string]executable_seq.Matcher {
 // prefix only.
 func (m *Mosdns) GetHTTPAPIMux() *http.ServeMux {
 	return m.httpAPIMux
+}
+
+// GetBadIPObserver returns the ip_observer.BadIPObserver. It returns nil if is not enabled.
+func (m *Mosdns) GetBadIPObserver() ip_observer.IPObserver {
+	return m.badIPObserver
+}
+
+func newMetricsReg() *prometheus.Registry {
+	reg := prometheus.NewRegistry()
+	reg.MustRegister(collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}))
+	reg.MustRegister(collectors.NewGoCollector())
+	return reg
 }

@@ -1,3 +1,5 @@
+//go:build !linux
+
 /*
  * Copyright (C) 2020-2022, IrineSistiana
  *
@@ -18,3 +20,9 @@
  */
 
 package server
+
+import "net"
+
+func newUDPConn(c *net.UDPConn) (cmcUDPConn, error) {
+	return newDummyUDPConn(c), nil
+}

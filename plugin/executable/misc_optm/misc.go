@@ -33,6 +33,10 @@ const (
 	PluginType = "misc_optm"
 )
 
+const (
+	maxUDPSize = 1200 // 1280 (min ipv6 mtu) - 40 (ipv6 header) - 8 (udp header) - 8 (pppoe header) - (24) reserved
+)
+
 func init() {
 	coremain.RegNewPersetPluginFunc("_misc_optm", func(bp *coremain.BP) (coremain.Plugin, error) {
 		return &optm{BP: bp}, nil
@@ -49,12 +53,20 @@ func (t *optm) Exec(ctx context.Context, qCtx *query_context.Context, next execu
 	q := qCtx.Q()
 
 	// Block query that is unusual.
-	if len(q.Question) != 1 || q.Question[0].Qclass != dns.ClassINET {
+	if isUnusualQuery(q) {
 		r := new(dns.Msg)
 		r.SetRcode(q, dns.RcodeRefused)
-		qCtx.SetResponse(r, query_context.ContextStatusRejected)
+		qCtx.SetResponse(r)
 		return nil
 	}
+
+	// limit edns0 udp size.
+	if opt := q.IsEdns0(); opt != nil {
+		if opt.UDPSize() > maxUDPSize {
+			opt.SetUDPSize(maxUDPSize)
+		}
+	}
+
 	if err := executable_seq.ExecChainNode(ctx, qCtx, next); err != nil {
 		return err
 	}
@@ -92,4 +104,13 @@ func (t *optm) Exec(ctx context.Context, qCtx *query_context.Context, next execu
 		dnsutils.RemoveEDNS0(r)
 	}
 	return nil
+}
+
+func isUnusualQuery(q *dns.Msg) bool {
+	return !isValidQuery(q) || len(q.Question) != 1 || q.Question[0].Qclass != dns.ClassINET
+}
+
+func isValidQuery(q *dns.Msg) bool {
+	return !q.Response && q.Opcode == dns.OpcodeQuery && !q.Authoritative && !q.Zero && // check header
+		len(q.Answer) == 0 && len(q.Ns) == 0 // check body
 }

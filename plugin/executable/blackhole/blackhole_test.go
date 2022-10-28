@@ -39,9 +39,9 @@ func Test_blackhole_Exec(t *testing.T) {
 	}{
 		{"drop response1", &Args{RCode: -1}, dns.TypeA, false, 0, ""},
 		{"respond with rcode 2", &Args{RCode: 2}, dns.TypeA, true, 2, ""},
-		{"respond with ipv4 1", &Args{IPv4: "127.0.0.1"}, dns.TypeA, true, 0, "127.0.0.1"},
-		{"respond with ipv4 2", &Args{IPv4: "127.0.0.1", RCode: 2}, dns.TypeAAAA, true, 2, ""},
-		{"respond with ipv6", &Args{IPv6: "127.0.0.1"}, dns.TypeAAAA, true, 0, "127.0.0.1"},
+		{"respond with ipv4 1", &Args{IPv4: []string{"127.0.0.1"}}, dns.TypeA, true, 0, "127.0.0.1"},
+		{"respond with ipv4 2", &Args{IPv4: []string{"127.0.0.1"}, RCode: 2}, dns.TypeAAAA, true, 2, ""},
+		{"respond with ipv6", &Args{IPv6: []string{"::1"}}, dns.TypeAAAA, true, 0, "::1"},
 	}
 
 	ctx := context.Background()
@@ -57,7 +57,7 @@ func Test_blackhole_Exec(t *testing.T) {
 			r := new(dns.Msg)
 			r.SetReply(q)
 			qCtx := query_context.NewContext(q, nil)
-			qCtx.SetResponse(r, query_context.ContextStatusResponded)
+			qCtx.SetResponse(r)
 
 			err = b.Exec(ctx, qCtx, nil)
 			if err != nil {

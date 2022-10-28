@@ -25,6 +25,7 @@ import (
 	"github.com/IrineSistiana/mosdns/v4/pkg/server"
 	"github.com/IrineSistiana/mosdns/v4/pkg/server/dns_handler"
 	"github.com/IrineSistiana/mosdns/v4/pkg/server/http_handler"
+	"github.com/pires/go-proxyproto"
 	"go.uber.org/zap"
 	"net"
 	"time"
@@ -53,11 +54,15 @@ func (m *Mosdns) startServers(cfg *ServerConfig) error {
 		queryTimeout = time.Duration(cfg.Timeout) * time.Second
 	}
 
-	dnsHandler := &dns_handler.DefaultHandler{
+	dnsHandlerOpts := dns_handler.EntryHandlerOpts{
 		Logger:             m.logger,
 		Entry:              entry,
 		QueryTimeout:       queryTimeout,
 		RecursionAvailable: true,
+	}
+	dnsHandler, err := dns_handler.NewEntryHandler(dnsHandlerOpts)
+	if err != nil {
+		return fmt.Errorf("failed to init entry handler, %w", err)
 	}
 
 	for _, lc := range cfg.Listeners {
@@ -79,18 +84,32 @@ func (m *Mosdns) startServerListener(cfg *ServerListenerConfig, dnsHandler dns_h
 	if cfg.IdleTimeout > 0 {
 		idleTimeout = time.Duration(cfg.IdleTimeout) * time.Second
 	}
-	s := &server.Server{
-		DNSHandler: dnsHandler,
-		HttpHandler: &http_handler.Handler{
-			DNSHandler:  dnsHandler,
-			Path:        cfg.URLPath,
-			SrcIPHeader: cfg.GetUserIPFromHeader,
-			Logger:      m.logger,
-		},
+
+	httpOpts := http_handler.HandlerOpts{
+		DNSHandler:  dnsHandler,
+		Path:        cfg.URLPath,
+		SrcIPHeader: cfg.GetUserIPFromHeader,
+		Logger:      m.logger,
+	}
+
+	httpHandler, err := http_handler.NewHandler(httpOpts)
+	if err != nil {
+		return fmt.Errorf("failed to init http handler, %w", err)
+	}
+
+	opts := server.ServerOpts{
+		DNSHandler:  dnsHandler,
+		HttpHandler: httpHandler,
 		Cert:        cfg.Cert,
 		Key:         cfg.Key,
 		IdleTimeout: idleTimeout,
 		Logger:      m.logger,
+	}
+	s := server.NewServer(opts)
+
+	// helper func for proxy protocol listener
+	requirePP := func(_ net.Addr) (proxyproto.Policy, error) {
+		return proxyproto.REQUIRE, nil
 	}
 
 	var run func() error
@@ -106,11 +125,17 @@ func (m *Mosdns) startServerListener(cfg *ServerListenerConfig, dnsHandler dns_h
 		if err != nil {
 			return err
 		}
+		if cfg.ProxyProtocol {
+			l = &proxyproto.Listener{Listener: l, Policy: requirePP}
+		}
 		run = func() error { return s.ServeTCP(l) }
 	case "tls", "dot":
 		l, err := net.Listen("tcp", cfg.Addr)
 		if err != nil {
 			return err
+		}
+		if cfg.ProxyProtocol {
+			l = &proxyproto.Listener{Listener: l, Policy: requirePP}
 		}
 		run = func() error { return s.ServeTLS(l) }
 	case "http":
@@ -118,11 +143,17 @@ func (m *Mosdns) startServerListener(cfg *ServerListenerConfig, dnsHandler dns_h
 		if err != nil {
 			return err
 		}
+		if cfg.ProxyProtocol {
+			l = &proxyproto.Listener{Listener: l, Policy: requirePP}
+		}
 		run = func() error { return s.ServeHTTP(l) }
 	case "https", "doh":
 		l, err := net.Listen("tcp", cfg.Addr)
 		if err != nil {
 			return err
+		}
+		if cfg.ProxyProtocol {
+			l = &proxyproto.Listener{Listener: l, Policy: requirePP}
 		}
 		run = func() error { return s.ServeHTTPS(l) }
 	default:

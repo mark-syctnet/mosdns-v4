@@ -115,13 +115,16 @@ func ParseFallbackNode(
 	if c.Secondary == nil {
 		return nil, errors.New("secondary is empty")
 	}
+	if logger == nil {
+		logger = zap.NewNop()
+	}
 
-	primaryECS, err := BuildExecutableLogicTree(c.Primary, logger, execs, matchers)
+	primaryECS, err := BuildExecutableLogicTree(c.Primary, logger.Named("primary"), execs, matchers)
 	if err != nil {
 		return nil, fmt.Errorf("invalid primary sequence: %w", err)
 	}
 
-	secondaryECS, err := BuildExecutableLogicTree(c.Secondary, logger, execs, matchers)
+	secondaryECS, err := BuildExecutableLogicTree(c.Secondary, logger.Named("secondary"), execs, matchers)
 	if err != nil {
 		return nil, fmt.Errorf("invalid secondary sequence: %w", err)
 	}
@@ -171,7 +174,7 @@ func (f *FallbackNode) exec(ctx context.Context, qCtx *query_context.Context) er
 func (f *FallbackNode) isolateDoPrimary(ctx context.Context, qCtx *query_context.Context) (err error) {
 	qCtxCopy := qCtx.Copy()
 	err = f.doPrimary(ctx, qCtxCopy)
-	qCtx.SetResponse(qCtxCopy.R(), qCtxCopy.Status())
+	qCtx.SetResponse(qCtxCopy.R())
 	return err
 }
 
@@ -273,7 +276,7 @@ func (f *FallbackNode) doFallback(ctx context.Context, qCtx *query_context.Conte
 		c <- &parallelECSResult{
 			qCtx: qCtxP,
 			err:  err,
-			from: 1,
+			from: 0,
 		}
 	}()
 
@@ -285,7 +288,7 @@ func (f *FallbackNode) doFallback(ctx context.Context, qCtx *query_context.Conte
 		c <- &parallelECSResult{
 			qCtx: qCtxS,
 			err:  err,
-			from: 2,
+			from: 1,
 		}
 	}()
 

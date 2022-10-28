@@ -25,8 +25,7 @@ import (
 	"github.com/IrineSistiana/mosdns/v4/pkg/dnsutils"
 	"github.com/miekg/dns"
 	"go.uber.org/zap"
-	"net"
-	"strconv"
+	"net/netip"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -34,8 +33,9 @@ import (
 
 // RequestMeta represents some metadata about the request.
 type RequestMeta struct {
-	// ClientIP contains the client ip address.
-	ClientIP net.IP
+	// ClientAddr contains the client ip address.
+	// It might be zero/invalid.
+	ClientAddr netip.Addr
 
 	// FromUDP indicates the request is from an udp socket.
 	FromUDP bool
@@ -43,7 +43,8 @@ type RequestMeta struct {
 
 // Context is a query context that pass through plugins
 // A Context will always have a non-nil Q.
-// Context MUST be created by NewContext.
+// Context MUST be created using NewContext.
+// All Context funcs are not safe for concurrent use.
 type Context struct {
 	// init at beginning
 	startTime     time.Time // when this Context was created
@@ -52,39 +53,12 @@ type Context struct {
 	id            uint32 // additional uint to distinguish duplicated msg
 	reqMeta       *RequestMeta
 
-	status ContextStatus
-	r      *dns.Msg
-	marks  map[uint]struct{}
+	r     *dns.Msg
+	marks map[uint]struct{}
 }
 
-type ContextStatus uint8
-
-const (
-	ContextStatusWaitingResponse ContextStatus = iota
-	ContextStatusResponded
-	ContextStatusServerFailed
-	ContextStatusDropped
-	ContextStatusRejected
-)
-
-var statusToStr = map[ContextStatus]string{
-	ContextStatusWaitingResponse: "waiting response",
-	ContextStatusResponded:       "responded",
-	ContextStatusServerFailed:    "server failed",
-	ContextStatusDropped:         "dropped",
-	ContextStatusRejected:        "rejected",
-}
-
-func (status ContextStatus) String() string {
-	s, ok := statusToStr[status]
-	if ok {
-		return s
-	}
-	return strconv.Itoa(int(status))
-}
-
-var id uint32
-var zeroMeta = &RequestMeta{}
+var contextUid uint32
+var zeroRequestMeta = &RequestMeta{}
 
 // NewContext creates a new query Context.
 // q is the query dns msg. It cannot be nil, or NewContext will panic.
@@ -95,17 +69,15 @@ func NewContext(q *dns.Msg, meta *RequestMeta) *Context {
 	}
 
 	if meta == nil {
-		meta = zeroMeta
+		meta = zeroRequestMeta
 	}
 
 	ctx := &Context{
 		q:             q,
 		originalQuery: q.Copy(),
 		reqMeta:       meta,
-		id:            atomic.AddUint32(&id, 1),
+		id:            atomic.AddUint32(&contextUid, 1),
 		startTime:     time.Now(),
-
-		status: ContextStatusWaitingResponse,
 	}
 
 	return ctx
@@ -122,8 +94,8 @@ func (ctx *Context) String() string {
 	} else {
 		question = "empty question"
 	}
-	if ctx.reqMeta.ClientIP != nil {
-		clientAddr = ctx.reqMeta.ClientIP.String()
+	if ctx.reqMeta.ClientAddr.IsValid() {
+		clientAddr = ctx.reqMeta.ClientAddr.String()
 	} else {
 		clientAddr = "unknown client"
 	}
@@ -143,7 +115,7 @@ func (ctx *Context) OriginalQuery() *dns.Msg {
 	return ctx.originalQuery
 }
 
-// ReqMeta returns the request metadata.
+// ReqMeta returns the request metadata. It always returns a non-nil RequestMeta.
 // The returned *RequestMeta is a reference shared by all ReqMeta.
 // Caller must not modify it.
 func (ctx *Context) ReqMeta() *RequestMeta {
@@ -155,17 +127,11 @@ func (ctx *Context) R() *dns.Msg {
 	return ctx.r
 }
 
-// Status returns the context status.
-func (ctx *Context) Status() ContextStatus {
-	return ctx.status
-}
-
 // SetResponse stores the response r to the context.
 // Note: It just stores the pointer of r. So the caller
 // shouldn't modify or read r after the call.
-func (ctx *Context) SetResponse(r *dns.Msg, status ContextStatus) {
+func (ctx *Context) SetResponse(r *dns.Msg) {
 	ctx.r = r
-	ctx.status = status
 }
 
 // Id returns the Context id.
@@ -201,7 +167,6 @@ func (ctx *Context) CopyTo(d *Context) *Context {
 	d.reqMeta = ctx.reqMeta
 	d.id = ctx.id
 
-	d.status = ctx.status
 	if r := ctx.r; r != nil {
 		d.r = r.Copy()
 	}

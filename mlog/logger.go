@@ -37,8 +37,9 @@ var (
 	stdout = zapcore.Lock(os.Stdout)
 	stderr = zapcore.Lock(os.Stderr)
 
-	l = newLogger(zap.InfoLevel, stdout, stderr)
-	s = l.Sugar()
+	lvl = zap.NewAtomicLevelAt(zap.InfoLevel)
+	l   = newLogger(lvl, stdout, stderr)
+	s   = l.Sugar()
 )
 
 func NewLogger(lc *LogConfig) (*zap.Logger, error) {
@@ -103,11 +104,15 @@ func newLogger(lvl zapcore.LevelEnabler, infoWriter, errWriter zapcore.WriteSync
 		zapcore.NewCore(zapcore.NewConsoleEncoder(defaultEncoderConfig()), infoWriter, infoLvl),
 		zapcore.NewCore(zapcore.NewConsoleEncoder(defaultEncoderConfig()), errWriter, errLvl),
 	)
-	return zap.New(core, zap.AddCaller())
+	return zap.New(core)
 }
 
 func L() *zap.Logger {
 	return l
+}
+
+func SetLevel(l zapcore.Level) {
+	lvl.SetLevel(l)
 }
 
 func S() *zap.SugaredLogger {
