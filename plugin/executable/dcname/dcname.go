@@ -14,7 +14,7 @@ const (
 )
 
 func init() {
-	coremain.RegNewPersetPluginFunc("dcname", func(bp *coremain.BP) (coremain.Plugin, error) {
+	coremain.RegNewPersetPluginFunc("_dcname", func(bp *coremain.BP) (coremain.Plugin, error) {
 		return &dcname{BP: bp}, nil
 	})
 }
