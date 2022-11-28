@@ -1,83 +1,59 @@
-//dispatcher/plugin/executable/dcname/dcname.go
 package dcname
- 
+
 import (
-  "context"
-  "github.com/IrineSistiana/mosdns/v3/dispatcher/handler"
-  "github.com/IrineSistiana/mosdns/v3/dispatcher/pkg/dnsutils"
-  "github.com/miekg/dns"
+	"context"
+	"github.com/IrineSistiana/mosdns/v4/coremain"
+	"github.com/IrineSistiana/mosdns/v4/pkg/dnsutils"
+	"github.com/IrineSistiana/mosdns/v4/pkg/executable_seq"
+	"github.com/IrineSistiana/mosdns/v4/pkg/query_context"
+	"github.com/miekg/dns"
+	"math/rand"
 )
- 
+
 const (
-  PluginType = "dcname"
+	PluginType = "dcname"
 )
- 
+
 func init() {
-  handler.RegInitFunc(PluginType, Init, func() interface{} { return new(Args) })
+	coremain.RegNewPersetPluginFunc("dcname", func(bp *coremain.BP) (coremain.Plugin, error) {
+		return &dcname{BP: bp}, nil
+	})
 }
- 
-var _ handler.ExecutablePlugin = (*dcname)(nil)
- 
-type Args struct {
-}
- 
+
+var _ coremain.ExecutablePlugin = (*dcname)(nil)
+
 type dcname struct {
-  *handler.BP
-  args *Args
+	*coremain.BP
 }
- 
-func Init(bp *handler.BP, args interface{}) (p handler.Plugin, err error) {
-  return newDcname(bp, args.(*Args)), nil
-}
- 
-func newDcname(bp *handler.BP, args *Args) handler.Plugin {
-  return &dcname{
-    BP:   bp,
-    args: args,
-  }
-}
- 
-func (t *dcname) Exec(ctx context.Context, qCtx *handler.Context, next handler.ExecutableChainNode) error {
-  if r := qCtx.R(); r != nil {
-    q := qCtx.Q()
-    if (len(q.Question) == 1 && len(r.Answer) >= 1) {
-      qname := q.Question[0].Name
-      qtype := q.Question[0].Qtype
-      rname := r.Answer[0].Header().Name
-      rtype := r.Answer[0].Header().Rrtype
-      if ((qtype == dns.TypeA || qtype == dns.TypeAAAA) && qname == rname && rtype == dns.TypeCNAME) {
-        var Answer2 []dns.RR
-        for i := range r.Answer {
-          var rr2 dns.RR
-          switch rr := r.Answer[i].(type) {
-          case *dns.A:
-            rr2 = &dns.A{
-              Hdr: dns.RR_Header{
-                Name:   qname,
-                Rrtype: dns.TypeA,
-                Class:  dns.ClassINET,
-                Ttl:    r.Answer[i].Header().Ttl,
-              },
-              A: rr.A,
-            }
-          case *dns.AAAA:
-            rr2 = &dns.AAAA{
-              Hdr: dns.RR_Header{
-                Name:   qname,
-                Rrtype: dns.TypeAAAA,
-                Class:  dns.ClassINET,
-                Ttl:    r.Answer[i].Header().Ttl,
-              },
-              AAAA: rr.AAAA,
-            }
-          default:
-            continue
-          }
-          Answer2 = append(Answer2, rr2)
-        }
-        r.Answer = Answer2
-      }
-    }
-  }
-  return handler.ExecChainNode(ctx, qCtx, next)
+
+func (t *dcname) Exec(ctx context.Context, qCtx *query_context.Context, next executable_seq.ExecutableChainNode) error {
+	q := qCtx.Q()
+	if err := executable_seq.ExecChainNode(ctx, qCtx, next); err != nil {
+		return err
+	}
+
+	r := qCtx.R()
+	if r == nil {
+		return nil
+	}
+
+	// Trim and shuffle answers for A and AAAA.
+	switch qt := q.Question[0].Qtype; qt {
+	case dns.TypeA, dns.TypeAAAA:
+		rr := r.Answer[:0]
+		for _, ar := range r.Answer {
+			if ar.Header().Rrtype == qt {
+				rr = append(rr, ar)
+			}
+			ar.Header().Name = q.Question[0].Name
+		}
+
+		rand.Shuffle(len(rr), func(i, j int) {
+			rr[i], rr[j] = rr[j], rr[i]
+		})
+
+		r.Answer = rr
+	}
+
+	return nil
 }
