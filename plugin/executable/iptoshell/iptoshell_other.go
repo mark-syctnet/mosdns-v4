@@ -32,7 +32,7 @@ type iptoshellPlugin struct {
 	*coremain.BP
 }
 
-func newiptoshellPlugin(bp *coremain.BP, args *Args) (*ipsetPlugin, error) {
+func newiptoshellPlugin(bp *coremain.BP, args *Args) (*iptoshellPlugin, error) {
 	return &iptoshellPlugin{BP: bp}, nil
 }
 
