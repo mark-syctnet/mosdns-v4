@@ -34,6 +34,7 @@ type Args struct {
 	SetName6 string `yaml:"set_bash_name6"`
 	Mask4    int    `yaml:"mask4"` // default 24
 	Mask6    int    `yaml:"mask6"` // default 32
+	Tagnum   int64    `yaml:"tagnum"` // default 0 
 }
 
 func Init(bp *coremain.BP, args interface{}) (p coremain.Plugin, err error) {
